@@ -1,0 +1,161 @@
+# auto-tester (advisory): which UI flows a change affects, checked in a real browser.
+# https://github.com/constantin-me/auto-tester
+#
+# Builds the PR's base, seeds a throwaway database from .autotester/fixture.json, records a
+# baseline, rebuilds at the head and reports what behaves differently. It never blocks a
+# merge: the check step always succeeds, the report is in the job summary and the artifact.
+#
+# Run by hand: Actions -> autotester -> Run workflow, with a base and head (SHA or branch).
+#
+# Repo files it uses (carried from the workflow's own commit onto the base checkout, since
+# older bases predate them): autotester.config.json, .autotester/fixture.json,
+# .autotester/mindmap/ (enriched mind-map; enrichment runs on a developer machine, never here).
+#
+# Secrets: TYPESAFE_API_KEY (Jev). The test login is the fixture's, public on purpose.
+# Variables (optional): AUTOTESTER_REF, the auto-tester branch or tag to run (default master).
+
+name: autotester
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Base commit or branch (what the baseline is recorded on)"
+        required: true
+        default: "main"
+      head:
+        description: "Head commit or branch (what is checked); empty = the workflow's ref"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: autotester-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+      STORE_DIR: .autotester/mindmap
+      CONFIG: ${{ github.workspace }}/autotester.config.json
+    steps:
+      - name: Check out the app (full history, for base..head)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Resolve base and head
+        env:
+          # through env, never pasted into the script: inputs are user text
+          BASE_IN: ${{ github.event.pull_request.base.sha || inputs.base }}
+          HEAD_IN: ${{ github.event.pull_request.head.sha || inputs.head || github.sha }}
+        run: |
+          resolve() { git rev-parse --verify --quiet "$1^{commit}" || git rev-parse --verify "origin/$1^{commit}"; }
+          echo "BASE_SHA=$(resolve "$BASE_IN")" >> "$GITHUB_ENV"
+          echo "HEAD_SHA=$(resolve "$HEAD_IN")" >> "$GITHUB_ENV"
+          [ -n "$TYPESAFE_API_KEY" ] || { echo "::error::secret TYPESAFE_API_KEY is not set"; exit 1; }
+
+      - name: Keep auto-tester's repo files across checkouts
+        run: |
+          mkdir -p "$RUNNER_TEMP/at"
+          cp autotester.config.json "$RUNNER_TEMP/at/"
+          cp -r .autotester "$RUNNER_TEMP/at/autotester"
+
+      - name: Check out auto-tester
+        uses: actions/checkout@v4
+        with:
+          repository: constantin-me/auto-tester
+          ref: ${{ vars.AUTOTESTER_REF || 'master' }}
+          path: .autotester-tool
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: .autotester-tool/package-lock.json
+
+      - name: Install auto-tester
+        working-directory: .autotester-tool
+        run: npm ci
+
+      # same change, same question -> same Jev answer: re-runs and unchanged pages are free
+      - uses: actions/cache@v4
+        with:
+          path: .autotester/cache
+          key: autotester-jev-${{ github.run_id }}
+          restore-keys: autotester-jev-
+
+      # DVinyl reads .env (never committed) and refuses empty or published secrets
+      - name: Write the app's .env with fresh secrets
+        run: |
+          {
+            echo "MONGODB_URL=mongodb://mongodb:27017/dvinyl"
+            echo "PASSJWT=$(openssl rand -hex 32)"
+            echo "SESSION_SECRET=$(openssl rand -hex 32)"
+            echo "PROD=false"
+            echo "VINYL_PORT=3099"
+            echo "BASE_URL="
+          } > "$RUNNER_TEMP/app.env"
+
+      # ---- baseline on the base ----------------------------------------------------
+      - name: Start the app at the base
+        run: |
+          git checkout --quiet --force "$BASE_SHA"
+          cp "$RUNNER_TEMP/at/autotester.config.json" .
+          mkdir -p .autotester && cp -r "$RUNNER_TEMP/at/autotester/." .autotester/
+          cp "$RUNNER_TEMP/app.env" .env
+          docker compose up -d --build
+          curl -s -o /dev/null --retry 60 --retry-delay 2 --retry-connrefused --retry-all-errors http://localhost:3099/login
+
+      - name: Seed the test user and data
+        working-directory: .autotester-tool
+        run: npm run qa:seed -- "$CONFIG"
+
+      - name: Record the baseline
+        working-directory: .autotester-tool
+        run: |
+          npm run bootstrap -- "$CONFIG"
+          npm run qa:baseline -- "$CONFIG"
+
+      # ---- check the head against it -----------------------------------------------
+      - name: Rebuild the app at the head
+        run: |
+          cp -r "$STORE_DIR" "$RUNNER_TEMP/mindmap-baseline"
+          git checkout --quiet --force "$HEAD_SHA"
+          cp "$RUNNER_TEMP/at/autotester.config.json" .
+          mkdir -p .autotester && cp -r "$RUNNER_TEMP/at/autotester/." .autotester/
+          rm -rf "$STORE_DIR" && cp -r "$RUNNER_TEMP/mindmap-baseline" "$STORE_DIR"
+          cp "$RUNNER_TEMP/app.env" .env
+          docker compose up -d --build
+          curl -s -o /dev/null --retry 60 --retry-delay 2 --retry-connrefused --retry-all-errors http://localhost:3099/login
+
+      - name: Check the change (advisory, never fails the job)
+        working-directory: .autotester-tool
+        run: npm run qa:check -- "$CONFIG" "$BASE_SHA..$HEAD_SHA" || true
+
+      - name: Report to the job summary
+        if: always()
+        run: |
+          # run dirs are named by timestamp, so the last in sort order is the newest
+          report=$(find .autotester/runs -maxdepth 1 -type d -name 'check-*' 2>/dev/null | sort | tail -1)
+          if [ -n "$report" ] && [ -f "$report/report.md" ]; then cat "$report/report.md" >> "$GITHUB_STEP_SUMMARY"
+          else echo "No check report was written; see the step logs." >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Upload the report and evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autotester-report
+          path: .autotester/runs/
+          if-no-files-found: warn
+
+      - name: App logs (on failure)
+        if: failure()
+        run: docker compose logs --no-color --tail 200
