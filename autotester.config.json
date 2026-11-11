@@ -1,0 +1,59 @@
+{
+  "repo": "Kyonew/DVinyl",
+  "appRoot": ".",
+  "framework": "express-ejs",
+  "crawler": {
+    "entry": "app.ts",
+    "expansions": [
+      {
+        "var": "plugin",
+        "from": "plugins/*/index.ts",
+        "fields": [
+          "id",
+          "routePrefix"
+        ]
+      }
+    ]
+  },
+  "env": {
+    "baseUrl": "http://localhost:3099"
+  },
+  "auth": {
+    "kind": "form",
+    "loginPath": "/login",
+    "fields": {
+      "input[name=email]": "qa@example.test",
+      "input[name=password]": "qa-fixture-password"
+    },
+    "submitSelector": "button[type=submit]"
+  },
+  "budget": {
+    "maxTokens": 300000
+  },
+  "flakiness": {
+    "retryCount": 2
+  },
+  "store": {
+    "backend": "committed-file",
+    "dir": ".autotester/mindmap"
+  },
+  "enrich": {
+    "backend": "claude-code",
+    "concurrency": 2
+  },
+  "jev": {
+    "model": "jev-1.13.0"
+  },
+  "qa": {
+    "disposable": true,
+    "seed": {
+      "path": "/backup/import",
+      "file": ".autotester/fixture.json"
+    },
+    "runsDir": ".autotester/runs",
+    "harvestDepth": 2,
+    "launchArgs": [
+      "--no-sandbox"
+    ]
+  }
+}
